@@ -32,6 +32,7 @@ from dimos.perception.detection.detectors.base import Detector
 from dimos.perception.detection.detectors.yolo import Yolo2DDetector
 from dimos.perception.detection.type.detection2d.base import Filter2D
 from dimos.perception.detection.type.detection2d.imageDetections2D import ImageDetections2D
+from dimos.perception.detection.visualization import letterbox_image
 from dimos.utils.decorators.decorators import simple_mcache
 from dimos.utils.reactive import backpressure
 
@@ -40,6 +41,7 @@ class Config(ModuleConfig):
     max_freq: float = 10
     detector: Callable[[Any], Detector] | None = Yolo2DDetector
     publish_detection_images: bool = True
+    visualization_crop_size: tuple[int, int] = (320, 320)
     camera_info: CameraInfo
     filter: Annotated[
         Sequence[Filter2D],
@@ -138,9 +140,11 @@ class Detection2DModule(Module):
         )
 
         def publish_cropped_images(detections: ImageDetections2D) -> None:
+            width, height = self.config.visualization_crop_size
             for index, detection in enumerate(detections[:3]):
                 image_topic = getattr(self, "detected_image_" + str(index))
-                image_topic.publish(detection.cropped_image())
+                crop = detection.cropped_image()
+                image_topic.publish(letterbox_image(crop, width, height))
 
         if self.config.publish_detection_images:
             self.detection_stream_2d().subscribe(publish_cropped_images)
