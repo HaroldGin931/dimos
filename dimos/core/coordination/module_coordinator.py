@@ -20,6 +20,7 @@ from contextlib import suppress
 import dataclasses
 import importlib
 import inspect
+import platform
 import shutil
 import sys
 import threading
@@ -42,6 +43,12 @@ from dimos.core.transport import (
     pZenohTransport,
 )
 from dimos.core.transport_factory import make_transport
+from dimos.protocol.service.zenohservice import (
+    ZENOH_LOCAL_ROUTER_ENDPOINT,
+    ZenohConfig,
+    ZenohService,
+    ZenohSessionPool,
+)
 from dimos.spec.utils import is_spec, spec_annotation_compliance, spec_structural_compliance
 from dimos.utils.generic import short_id
 from dimos.utils.logging_config import setup_logger
@@ -90,13 +97,28 @@ class ModuleCoordinator(Resource):
         self._modules_lock = threading.RLock()
         self._rpc_lock = threading.RLock()
         self._coordinator_rpc: CoordinatorRPC | None = None
+        self._local_zenoh_router: ZenohService | None = None
+        self._local_zenoh_pool: ZenohSessionPool | None = None
+        self._zenoh_config_before_router: tuple[str, str] | None = None
 
     def start(self) -> None:
         from dimos.core.o3dpickle import register_picklers
 
         register_picklers()
-        for m in self._managers.values():
-            m.start()
+        self._prepare_local_zenoh_router()
+        try:
+            # Start the forkserver workers before opening Zenoh in this process.
+            # Zenoh's process-global runtime does not survive a later fork.
+            for m in self._managers.values():
+                m.start()
+            if self._local_zenoh_router is not None:
+                self._local_zenoh_router.start()
+        except BaseException:
+            for m in self._managers.values():
+                with suppress(Exception):
+                    m.stop()
+            self._stop_local_zenoh_router()
+            raise
         self._started = True
 
     def stop(self) -> None:
@@ -120,6 +142,44 @@ class ModuleCoordinator(Resource):
                 logger.error("Error stopping manager", manager=type(m).__name__, exc_info=True)
 
         safe_thread_map(tuple(self._managers.values()), _stop_manager)
+        self._stop_local_zenoh_router()
+
+    def _prepare_local_zenoh_router(self) -> None:
+        """Route macOS worker sessions explicitly instead of relying on lo0 multicast."""
+        if self._global_config.transport != "zenoh" or platform.system() != "Darwin":
+            return
+
+        router_config = ZenohConfig()
+        endpoint = ZENOH_LOCAL_ROUTER_ENDPOINT
+        self._zenoh_config_before_router = (
+            self._global_config.zenoh_mode,
+            self._global_config.zenoh_connect,
+        )
+        self._global_config.update(zenoh_mode="client", zenoh_connect=endpoint)
+
+        self._local_zenoh_pool = ZenohSessionPool()
+        self._local_zenoh_router = ZenohService(
+            session_pool=self._local_zenoh_pool,
+            mode="router",
+            connect=router_config.connect,
+            listen=[endpoint],
+            scouting=router_config.scouting,
+            scouting_interface=router_config.scouting_interface,
+            multicast=router_config.multicast,
+            gossip=router_config.gossip,
+            connect_timeout=router_config.connect_timeout,
+        )
+
+    def _stop_local_zenoh_router(self) -> None:
+        if self._local_zenoh_pool is not None:
+            self._local_zenoh_pool.close_all()
+        self._local_zenoh_router = None
+        self._local_zenoh_pool = None
+
+        if self._zenoh_config_before_router is not None:
+            mode, connect = self._zenoh_config_before_router
+            self._global_config.update(zenoh_mode=mode, zenoh_connect=connect)
+            self._zenoh_config_before_router = None
 
     def start_rpc_service(self) -> None:
         """Expose the coordinator's API as @rpc methods over LCM."""

@@ -36,6 +36,10 @@ logger = setup_logger()
 # Zenoh's own default port, which robot-side bridges listen on.
 ROBOT_ZENOH_PORT = 7447
 
+# Coordinator-owned router used to connect sibling processes on macOS, where
+# multicast scouting pinned to lo0 does not discover them reliably.
+ZENOH_LOCAL_ROUTER_ENDPOINT = "tcp/127.0.0.1:7447"
+
 # Poll interval while waiting for connect endpoints to link.
 _CONNECT_POLL_INTERVAL = 0.05
 
