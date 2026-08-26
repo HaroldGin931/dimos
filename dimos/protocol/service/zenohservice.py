@@ -63,9 +63,12 @@ def _default_connect_endpoints() -> list[str]:
     """
     if global_config.transport != "zenoh":
         return []
+    explicit = _locators(global_config.zenoh_connect)
+    if global_config.zenoh_mode == "client" and explicit:
+        return list(dict.fromkeys(explicit))
     ips = _locators(f"{global_config.robot_ip or ''},{global_config.robot_ips or ''}")
     robots = [f"tcp/{ip}" if ":" in ip else f"tcp/{ip}:{ROBOT_ZENOH_PORT}" for ip in ips]
-    return list(dict.fromkeys(robots + _locators(global_config.zenoh_connect)))
+    return list(dict.fromkeys(robots + explicit))
 
 
 def _default_scouting() -> bool:
