@@ -4,7 +4,7 @@ This document is an executable `md-babel-py` demo. Edit the recording settings
 below, then run the complete pipeline from the repository root:
 
 ```sh skip
-uv run --extra misc md-babel-py run dimos/memory/find_person.md --no-cache --execution-timeout 600
+uv run --extra misc md-babel-py run dimos/memory/find_person.md --execution-timeout 600
 ```
 
 The `misc` extra provides EdgeTAM's `sam2` runtime.
@@ -34,13 +34,14 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 
-demo_started = perf_counter()
+from dimos.utils.logging_config import setup_logger
+
 output_time_range: tuple[float, float] | None = None
 rerun_output = Path(rrd_path)
+logger = setup_logger()
 
 store = SqliteStore(path=recording_path, must_exist=True)
 images = store.stream("color_image", Image)
-available_streams = set(store.list_streams())
 lidar = store.stream("lidar", PointCloud2) if "lidar" in available_streams else None
 odometry = store.stream("odom", PoseStamped) if "odom" in available_streams else None
 ```
@@ -69,8 +70,10 @@ from dimos.memory.transform import peaks
 from dimos.models.embedding.clip import CLIPModel
 from dimos.models.vl.moondream import MoondreamVlModel
 
+candidate_preparation_started = perf_counter()
 image_count = images.count()
 
+clip_started = perf_counter()
 with CLIPModel() as clip:
     similarity_signal = (
         images
@@ -91,7 +94,9 @@ with CLIPModel() as clip:
         (sample.ts, sample.similarity) for sample in similarity_signal
     )  # Lightweight copy for Rerun.
     del similarity_signal
+clip_seconds = perf_counter() - clip_started
 
+moondream_started = perf_counter()
 with MoondreamVlModel() as moondream:
     candidates = tuple(
         detection
@@ -99,9 +104,40 @@ with MoondreamVlModel() as moondream:
         for detection in moondream.query_detections(peak.data, person_prompt).detections
     )
 
+moondream_seconds = perf_counter() - moondream_started
+
 if not candidates:
     raise LookupError("no person boxes found in the selected semantic peaks")
 ```
+
+<details>
+<summary>Candidate preparation logging</summary>
+
+```python session=find-person no-result
+logger.info(
+    "\n".join(
+        (
+            "",
+            "FindPerson candidate preparation summary",
+            "----------------------------------------",
+            f"input images         : {image_count}",
+            f"CLIP image embeddings: {image_count}",
+            f"similarity samples   : {len(similarity_samples)}",
+            f"semantic peaks       : {len(semantic_peaks)}",
+            f"Moondream calls      : {len(semantic_peaks)}",
+            f"candidate boxes      : {len(candidates)}",
+            "",
+            "embedding cache      : no (ephemeral transform)",
+            f"CLIP + peak search   : {clip_seconds:.3f}s",
+            f"Moondream detection  : {moondream_seconds:.3f}s",
+            f"preparation total    : {perf_counter() - candidate_preparation_started:.3f}s",
+            "----------------------------------------",
+        )
+    )
+)
+```
+
+</details>
 
 ## 2. Using FindPerson
 
@@ -120,6 +156,8 @@ flowchart LR
 ### FindPerson execution code
 
 ```python session=find-person no-result
+from contextlib import contextmanager
+
 import dimos.memory.person_find as person_find_module
 from dimos.memory.person_find import FindPerson
 
@@ -127,17 +165,27 @@ find_person = FindPerson(candidates)
 ```
 
 <details>
-<summary>Candidate tracing helpers for Rerun</summary>
+<summary>Candidate tracing and metrics helpers</summary>
 
 ```python session=find-person no-result
 candidate_trace = []
 candidate_rank = {id(candidate): rank for rank, candidate in enumerate(candidates)}
 candidate_manager_type = person_find_module._CandidateManager
-trace_state = {"current": None}
+trace_state = {"selected": 0, "current": None, "expect_probe": False}
+edge_tam_metrics = {
+    "model_seconds": 0.0,
+    "init_calls": 0,
+    "init_seconds": 0.0,
+    "probe_calls": 0,
+    "probe_seconds": 0.0,
+    "propagation_calls": 0,
+    "propagation_seconds": 0.0,
+}
 
 original_pop_candidate = candidate_manager_type.pop_candidate
 original_matches_candidate = candidate_manager_type.matches_candidate
 original_drop_by_window = candidate_manager_type.drop_by_window
+original_edge_tam_processor = person_find_module.EdgeTAMProcessor
 
 
 def remaining_candidate_ranks(manager) -> list[int]:
@@ -146,15 +194,22 @@ def remaining_candidate_ranks(manager) -> list[int]:
 
 def trace_pop_candidate(manager):
     candidate = original_pop_candidate(manager)
-    trace_state["current"] = candidate_rank[id(candidate)]
+    rank = candidate_rank[id(candidate)]
+    trace_state["current"] = rank
+    trace_state["expect_probe"] = trace_state["selected"] > 0
+    trace_state["selected"] += 1
+    candidate_trace.append(
+        ("selected", remaining_candidate_ranks(manager), {"current": rank})
+    )
     return candidate
 
 
 def trace_matches_candidate(manager, candidate, prediction):
     matches = original_matches_candidate(manager, candidate, prediction)
     if not matches:
+        current = trace_state["current"]
         candidate_trace.append(
-            ("rejected", (), {"current": trace_state["current"]})
+            ("rejected", remaining_candidate_ranks(manager), {"current": current})
         )
         trace_state["current"] = None
     return matches
@@ -178,16 +233,65 @@ def trace_drop_by_window(manager, start: float, end: float) -> None:
         )
     )
     trace_state["current"] = None
+
+
+def traced_edge_tam_processor():
+    model_started = perf_counter()
+    tracker = original_edge_tam_processor()
+    edge_tam_metrics["model_seconds"] += perf_counter() - model_started
+    original_init_track = tracker.init_track
+    original_process_image = tracker.process_image
+
+    def trace_init_track(*args, **kwargs):
+        started = perf_counter()
+        try:
+            return original_init_track(*args, **kwargs)
+        finally:
+            edge_tam_metrics["init_calls"] += 1
+            edge_tam_metrics["init_seconds"] += perf_counter() - started
+
+    def trace_process_image(image):
+        metric = "probe" if trace_state["expect_probe"] else "propagation"
+        trace_state["expect_probe"] = False
+        started = perf_counter()
+        try:
+            return original_process_image(image)
+        finally:
+            edge_tam_metrics[f"{metric}_calls"] += 1
+            edge_tam_metrics[f"{metric}_seconds"] += perf_counter() - started
+
+    tracker.init_track = trace_init_track
+    tracker.process_image = trace_process_image
+    return tracker
+
+
+@contextmanager
+def trace_find_person_execution():
+    tracking_started = perf_counter()
+    try:
+        with (
+            patch.object(candidate_manager_type, "pop_candidate", trace_pop_candidate),
+            patch.object(
+                candidate_manager_type,
+                "matches_candidate",
+                trace_matches_candidate,
+            ),
+            patch.object(candidate_manager_type, "drop_by_window", trace_drop_by_window),
+            patch.object(
+                person_find_module,
+                "EdgeTAMProcessor",
+                side_effect=traced_edge_tam_processor,
+            ),
+        ):
+            yield
+    finally:
+        edge_tam_metrics["tracking_seconds"] = perf_counter() - tracking_started
 ```
 
 </details>
 
 ```python session=find-person no-result
-with (
-    patch.object(candidate_manager_type, "pop_candidate", trace_pop_candidate),
-    patch.object(candidate_manager_type, "matches_candidate", trace_matches_candidate),
-    patch.object(candidate_manager_type, "drop_by_window", trace_drop_by_window),
-):
+with trace_find_person_execution():
     tracked = (
         images
         .transform(find_person)
@@ -200,8 +304,65 @@ with (
 
 if not results:
     raise RuntimeError("FindPerson produced no output")
-stream_start_ts = results[0].ts  # Shared zero point for Rerun time.
+stream_start_ts = results[0].ts  # Shared zero point for logs and Rerun time.
 ```
+
+<details>
+<summary>Candidate and EdgeTAM logging</summary>
+
+```python session=find-person no-result
+for event, remaining, details in candidate_trace:
+    current = details["current"]
+    if event == "selected":
+        logger.info(
+            "FindPerson candidate selected",
+            rank=current,
+            candidate=f"+{candidates[current].ts - stream_start_ts:.3f}s",
+        )
+    elif event == "rejected":
+        logger.info(
+            "FindPerson candidate dropped",
+            rank=current,
+            candidate=f"+{candidates[current].ts - stream_start_ts:.3f}s",
+            reason="validation_failed",
+            remaining=remaining,
+        )
+    elif event == "window":
+        logger.info(
+            "FindPerson candidates dropped by window",
+            accepted=current,
+            covered=[rank for rank in details["covered"] if rank != current],
+            window=(
+                f"+{details['start'] - stream_start_ts:.3f}s"
+                f"..+{details['end'] - stream_start_ts:.3f}s"
+            ),
+            remaining=remaining,
+        )
+
+logger.info(
+    "\n".join(
+        (
+            "",
+            "FindPerson EdgeTAM summary",
+            "--------------------------",
+            f"input frames        : {len(results)}",
+            f"stream time         : +0.000s..+{results[-1].ts - stream_start_ts:.3f}s",
+            f"init_track calls    : {edge_tam_metrics['init_calls']}",
+            f"candidate probes    : {edge_tam_metrics['probe_calls']}",
+            f"propagation frames  : {edge_tam_metrics['propagation_calls']}",
+            "",
+            f"model load          : {edge_tam_metrics['model_seconds']:.3f}s",
+            f"init_track total    : {edge_tam_metrics['init_seconds']:.3f}s",
+            f"candidate probe     : {edge_tam_metrics['probe_seconds']:.3f}s",
+            f"frame propagation   : {edge_tam_metrics['propagation_seconds']:.3f}s",
+            f"tracking total      : {edge_tam_metrics['tracking_seconds']:.3f}s",
+            "--------------------------",
+        )
+    )
+)
+```
+
+</details>
 
 ## 3. How EdgeTAM works in FindPerson
 
@@ -353,6 +514,7 @@ candidate_colors = {
     "covered": [255, 215, 0],
 }
 
+rerun_started = perf_counter()
 rerun_output.unlink(missing_ok=True)  # Do not mix this run with the previous .rrd.
 rerun_init("find_person")
 rr.save(str(rerun_output))
@@ -513,11 +675,21 @@ try:
 finally:
     rr.rerun_shutdown()  # Flush and close the .rrd.
     store.stop()
+    logger.info(
+        "\n".join(
+            (
+                "",
+                "FindPerson Rerun summary",
+                "------------------------",
+                f"output frames : {len(results)}",
+                f"output time   : +0.000s..+{results[-1].ts - stream_start_ts:.3f}s",
+                f"export total  : {perf_counter() - rerun_started:.3f}s",
+                "------------------------",
+            )
+        )
+    )
 
-print(
-    f"Wrote {len(results)} frames to {rerun_output} "
-    f"in {perf_counter() - demo_started:.3f}s"
-)
+print(f"Wrote {len(results)} frames to {rerun_output}")
 ```
 
 </details>
