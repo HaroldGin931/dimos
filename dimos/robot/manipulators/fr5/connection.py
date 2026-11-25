@@ -49,6 +49,11 @@ logger = setup_logger()
 
 SERVO_PERIOD_S = 0.008
 LINK_TIMEOUT_S = 0.1
+# Codes the controller shows in its fault fields without stopping the arm or
+# needing a reset. It flags 10/0 on and off while the wrist sits at j5 = 0,
+# stays enabled, answers GetRobotErrorCode with 0/0, and moves away normally.
+_NOTICES = {(10, 0): "a singular pose"}
+_NOTICE_LOG_INTERVAL_S = 5.0
 _SERVO_START = 689
 _SERVO_J = 376
 _SDK_RPC_PORT = 20003
@@ -92,9 +97,11 @@ class FR5Connection(ConnectionModule):
 
     A servo session starts with the first command and ends on ``halt``, e.g.
     when commands stop; the next command starts a new one. Stale feedback, a
-    fault, a safety stop, a target too fast or too far from the measured
-    position, or a refused or unanswered UDP command ends the session for good:
-    restart the blueprint to resume.
+    fault, a safety stop, a target too far from the measured position, or a
+    refused or unanswered UDP command ends the session for good: restart the
+    blueprint to resume. A target further ahead than the joint's top speed
+    covers in one period is approached one such step per ServoJ. The
+    controller's singular-pose notice is logged and ends nothing.
     """
 
     config: FR5ConnectionConfig
@@ -117,6 +124,7 @@ class FR5Connection(ConnectionModule):
         self._pending: tuple[int, int, float] | None = None
         self._replies: SimpleQueue[tuple[int, int, str, float]] = SimpleQueue()
         self._fault: str | None = None
+        self._notice_logged_at = float("-inf")
         self._stop_reader = threading.Event()
         self._reader: threading.Thread | None = None
 
@@ -181,11 +189,12 @@ class FR5Connection(ConnectionModule):
             # A session's first ServoJ holds the measured position.
             target = self._measured
             if self._last_target:
-                target = [
-                    values.get(f"{joint}/{Interface.POSITION}", measured)
-                    for joint, measured in zip(FR5_JOINT_NAMES, self._measured, strict=True)
-                ]
-                self._check_target(target)
+                target = self._bounded_target(
+                    [
+                        values.get(f"{joint}/{Interface.POSITION}", measured)
+                        for joint, measured in zip(FR5_JOINT_NAMES, self._measured, strict=True)
+                    ]
+                )
             self._pending = (frame, _SERVO_J, time.monotonic() + LINK_TIMEOUT_S)
             _check(
                 "ServoJ",
@@ -195,8 +204,18 @@ class FR5Connection(ConnectionModule):
             )
             self._last_target = target
         except Exception as error:
-            self._fault = f"{error}; restart the FR5 blueprint to resume"
+            self._latch(error)
             raise
+
+    def _latch(self, error: Exception) -> None:
+        """End the session for good, and log where the arm was, in degrees."""
+        self._fault = f"{error}; restart the FR5 blueprint to resume"
+        logger.warning(
+            "FR5Connection fault",
+            error=str(error),
+            measured_deg=[round(math.degrees(angle), 2) for angle in self._measured],
+            last_target_deg=[round(math.degrees(angle), 2) for angle in self._last_target],
+        )
 
     def halt(self) -> None:
         self._pending = None
@@ -205,9 +224,15 @@ class FR5Connection(ConnectionModule):
             self._started_servo = False
             _check("ServoMoveEnd", self._sdk.ServoMoveEnd(cmdType=1))
 
-    def _check_target(self, target: list[float]) -> None:
-        # ServoJ reaches each target within one period, so the step from the
-        # last target is the commanded speed.
+    def _bounded_target(self, target: list[float]) -> list[float]:
+        """Step each joint toward ``target`` by at most its top speed for one period.
+
+        ServoJ reaches each target within one period, so the step from the last
+        target is the commanded speed. Commands dropped while a reply is pending,
+        or a late coordinator tick, put the next target more than a step ahead:
+        the arm then lags it briefly and catches up, never faster than the model.
+        """
+        bounded = []
         for joint, angle, previous, measured, step, reach in zip(
             FR5_JOINT_NAMES,
             target,
@@ -217,10 +242,11 @@ class FR5Connection(ConnectionModule):
             self._reach,
             strict=True,
         ):
-            if abs(angle - previous) > step:
-                raise ValueError(f"FR5 {joint} target step exceeds the model joint speed")
+            angle = min(max(angle, previous - step), previous + step)
             if abs(angle - measured) > reach:
                 raise ValueError(f"FR5 {joint} target is too far from its measured position")
+            bounded.append(angle)
+        return bounded
 
     def _close_sdk(self) -> None:
         sdk, self._sdk = self._sdk, None
@@ -248,7 +274,8 @@ class FR5Connection(ConnectionModule):
         stamp = (state.second, state.millisecond)
         if self._feedback_stamp == stamp:
             return False
-        if state.main_code or state.sub_code:
+        code = (state.main_code, state.sub_code)
+        if any(code) and code not in _NOTICES:
             raise RuntimeError(f"FR5 fault {state.main_code}/{state.sub_code}")
         if (
             state.EmergencyStop
@@ -265,6 +292,12 @@ class FR5Connection(ConnectionModule):
         self._feedback_stamp = stamp
         self._measured = positions
         self._measured_at = received_at
+        if code in _NOTICES and received_at - self._notice_logged_at >= _NOTICE_LOG_INTERVAL_S:
+            self._notice_logged_at = received_at
+            logger.warning(
+                f"FR5 reports {_NOTICES[code]} ({code[0]}/{code[1]}); carrying on",
+                measured_deg=[round(math.degrees(angle), 2) for angle in positions],
+            )
         if self._connected:
             wall_time = time.time() - (time.monotonic() - received_at)
             self.joint_state.publish(
@@ -281,8 +314,8 @@ class FR5Connection(ConnectionModule):
                     self._check_link()
                     self._read_state()
                 except Exception as error:
-                    self._fault = f"{error}; restart the FR5 blueprint to resume"
-                    self._report(self._fault)
+                    self._latch(error)
+                    self._report(self._fault or "")
                     try:
                         self.halt()
                     except Exception as halt_error:

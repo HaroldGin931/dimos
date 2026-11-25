@@ -14,6 +14,8 @@
 
 """The FAIRINO FR5 v6 model and joint position interface."""
 
+import math
+
 from dimos.control.connection.connection_module import ConnectionConfig
 from dimos.control.contract.keys import Interface
 from dimos.manipulation.planning.groups.models import PlanningGroupDefinition
@@ -29,10 +31,31 @@ _SOURCE = RobotDescriptionSource(
 _DESCRIPTION = _SOURCE / "fairino_description"
 _JOINT_NAMES = joint_names(6, prefix="j")
 FR5_JOINT_NAMES = tuple(f"arm/{joint}" for joint in _JOINT_NAMES)
-_MODEL = RobotModel.from_file(
-    _DESCRIPTION / "urdf/fairino5_v6.urdf",
-    package_paths={"fairino_description": _DESCRIPTION},
-).with_renamed_joints(dict(zip(_JOINT_NAMES, FR5_JOINT_NAMES, strict=True)))
+# Home: folded over the base on the working side, in whole degrees. The elbow
+# is 5 degrees inside the controller's 160 degree soft limit and j6 is off its
+# 175 degree limit. The wrist (j5) is at +90: far from its singular zero, where
+# a straight-line jog spins joints 4 and 6, and with the flange facing up, away
+# from the base.
+FR5_HOME_DEG = (155.0, -160.0, 155.0, -85.0, 90.0, 165.0)
+
+
+def fr5_model(*, robot: str | None = None) -> RobotModel:
+    """The FR5 v6 URDF, from FAIRINO's frcobot_ros2 description.
+
+    Args:
+        robot: Name the joints under this robot, e.g. "arm" gives "arm/j1".
+            Links keep their names.
+    """
+    model = RobotModel.from_file(
+        _DESCRIPTION / "urdf/fairino5_v6.urdf",
+        package_paths={"fairino_description": _DESCRIPTION},
+    )
+    if not robot:
+        return model
+    return model.with_renamed_joints({joint: f"{robot}/{joint}" for joint in _JOINT_NAMES})
+
+
+_MODEL = fr5_model(robot="arm")
 
 
 def fr5_coordinator_connection() -> ConnectionConfig:
@@ -60,5 +83,5 @@ def make_fr5_model_config() -> RobotModelConfig:
                 tip_link="wrist3_link",
             )
         ],
-        home_joints=[0.0] * len(FR5_JOINT_NAMES),
+        home_joints=[math.radians(angle) for angle in FR5_HOME_DEG],
     )

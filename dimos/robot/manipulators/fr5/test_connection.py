@@ -185,6 +185,23 @@ def test_feedback_is_in_radians_and_targets_start_with_a_hold_in_degrees(rig: Ri
     rig.sdk.RobotEnable.assert_not_called()
 
 
+def test_a_target_ahead_of_the_joint_speed_is_approached_one_step_per_servoj(rig: Rig) -> None:
+    # One 8 ms step at the rig's 2 rad/s; the target is three steps ahead, as
+    # after commands dropped while a reply was pending.
+    step = 2.0 * 0.008
+    ahead = [math.radians(angle) + 3 * step for angle in _MEASURED_DEG]
+    rig.begin_motion()
+    for frame in (1, 2):
+        rig.ack(frame, 376)
+        rig.targets.publish(JointState(name=_JOINTS, position=ahead))
+
+    assert [servo.args[0] for servo in rig.sdk.ServoJ.call_args_list[1:]] == [
+        pytest.approx([angle + math.degrees(steps * step) for angle in _MEASURED_DEG])
+        for steps in (1, 2)
+    ]
+    assert rig.arm.status().last_error is None
+
+
 def test_refuses_to_start_if_the_arm_is_disabled(rig: Rig) -> None:
     rig.sdk.feedback.rbtEnableState = 0
     with pytest.raises(RuntimeError, match="not enabled"):
@@ -233,3 +250,25 @@ def test_feedback_or_reply_timeout_ends_the_servo_session(
     rig.ack(1, 376)
     rig.move()
     rig.sdk.ServoJ.assert_called_once()
+
+
+def test_the_singular_pose_notice_does_not_end_the_servo_session(rig: Rig) -> None:
+    rig.sdk.feedback.main_code = 10
+    rig.begin_motion()
+    rig.ack(1, 376)
+    rig.move()
+
+    assert rig.sdk.ServoJ.call_count == 2
+    assert rig.arm.status().last_error is None
+    rig.sdk.ServoMoveEnd.assert_not_called()
+
+
+def test_a_controller_fault_ends_the_servo_session(rig: Rig) -> None:
+    rig.begin_motion()
+    rig.ack(1, 376)
+    rig.sdk.feedback.main_code, rig.sdk.feedback.sub_code = 4, 4
+
+    wait_until(lambda: rig.arm.status().last_error is not None, timeout=1, interval=0.01)
+
+    assert "FR5 fault 4/4" in str(rig.arm.status().last_error)
+    rig.sdk.ServoMoveEnd.assert_called_once_with(cmdType=1)
