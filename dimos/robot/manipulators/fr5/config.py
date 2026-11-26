@@ -37,10 +37,29 @@ FR5_JOINT_NAMES = tuple(f"arm/{joint}" for joint in _JOINT_NAMES)
 # a straight-line jog spins joints 4 and 6, and with the flange facing up, away
 # from the base.
 FR5_HOME_DEG = (155.0, -160.0, 155.0, -85.0, 90.0, 165.0)
+# The controller's soft limits, j1 to j6, in degrees. It faults (3/n) as joint n
+# reaches one, and then takes no command until the joint is dragged back.
+FR5_SOFT_LIMITS_DEG = (
+    (-175.0, 175.0),
+    (-265.0, 85.0),
+    (-160.0, 160.0),
+    (-265.0, 85.0),
+    (-175.0, 175.0),
+    (-175.0, 175.0),
+)
+# How fast any joint may be told to turn, by a jog, a Viser joint slider or a
+# planned trajectory; far below the URDF's 3.15 rad/s. At 1 rad/s a jog near a
+# singular pose, turning several joints at once, set off the controller's
+# collision detection with nothing touched.
+FR5_MAX_JOINT_VELOCITY_RAD_S = 0.3
+# How far inside the soft limits the model's limits are, so that no jog or
+# planned trajectory is sent to one.
+FR5_LIMIT_MARGIN_DEG = 2.0
 
 
 def fr5_model(*, robot: str | None = None) -> RobotModel:
-    """The FR5 v6 URDF, from FAIRINO's frcobot_ros2 description.
+    """The FR5 v6 URDF, from FAIRINO's frcobot_ros2 description, with its joint
+    limits ``FR5_LIMIT_MARGIN_DEG`` inside the controller's soft limits.
 
     Args:
         robot: Name the joints under this robot, e.g. "arm" gives "arm/j1".
@@ -50,6 +69,12 @@ def fr5_model(*, robot: str | None = None) -> RobotModel:
         _DESCRIPTION / "urdf/fairino5_v6.urdf",
         package_paths={"fairino_description": _DESCRIPTION},
     )
+    for joint, (lower, upper) in zip(_JOINT_NAMES, FR5_SOFT_LIMITS_DEG, strict=True):
+        model = model.with_joint_position_limits(
+            joint,
+            lower=math.radians(lower + FR5_LIMIT_MARGIN_DEG),
+            upper=math.radians(upper - FR5_LIMIT_MARGIN_DEG),
+        )
     if not robot:
         return model
     return model.with_renamed_joints({joint: f"{robot}/{joint}" for joint in _JOINT_NAMES})
@@ -69,10 +94,13 @@ def fr5_coordinator_connection() -> ConnectionConfig:
 
 
 def make_fr5_model_config() -> RobotModelConfig:
-    """Configure the FR5 planning group with the coordinator's joint names."""
+    """Configure the FR5 planning group with the coordinator's joint names, to
+    plan no faster than ``FR5_MAX_JOINT_VELOCITY_RAD_S``."""
     return RobotModelConfig(
         # The vendor's MoveIt configuration supplies 0.7 rad/s² for each axis.
-        model=_MODEL.with_default_joint_acceleration_limit(0.7),
+        model=_MODEL.with_joint_velocity_limits(
+            dict.fromkeys(FR5_JOINT_NAMES, FR5_MAX_JOINT_VELOCITY_RAD_S)
+        ).with_default_joint_acceleration_limit(0.7),
         srdf_path=_SOURCE / "fairino5_v6_moveit2_config/config/fairino5_v6_robot.srdf",
         joint_names=list(FR5_JOINT_NAMES),
         planning_groups=[

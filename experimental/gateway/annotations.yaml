@@ -1090,6 +1090,19 @@ robots:
           description: Move an A-750 arm with this computer's keyboard.
           recommended_config:
           - {module: a750connection, field: device_path, label: Serial port, placeholder: /dev/ttyACM0, required: true}
+    fr5:
+      name: FAIRINO FR5
+      description: FAIRINO's FR5 v6 collaborative arm, over Ethernet.
+      type: arm
+      manufacturer: FAIRINO
+      dirs: [dimos/robot/manipulators/fr5]
+      blueprints:
+        keyboard-teleop-fr5:
+          title: FR5 keyboard driving
+          description: Move a FAIRINO FR5 with this computer's keyboard.
+          recommended_config:
+          - *robot_or_simulator
+          - {module: fr5connection, field: ip, label: FR5 IP, placeholder: 192.168.58.2, required: false, when: {simulation: ''}}
     coordinators:
       name: Coordinators and mocks
       description: Arm combinations, mobile bases and mock hardware behind dimos's ControlCoordinator.
