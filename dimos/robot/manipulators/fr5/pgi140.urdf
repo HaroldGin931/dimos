@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DH-Robotics PGI-140-80 parallel gripper, as boxes.
+
+  Each box is the bounding box of a part of DH's own meshes, so the model is
+  never smaller than the gripper. DH's URDF is not used: its collision meshes
+  sit away from its visual ones, its second finger's limits contradict its
+  mimic, and every mass in it is zero.
+
+  gripper_base's origin is the centre of the mounting face, z towards the
+  fingers. The joint "gripper" is how far each finger is from closed, in
+  metres: 0 closed, 0.04 open (80 mm between the fingers). The masses are an
+  even guess at DH's 1 kg total.
+-->
+<robot name="pgi140">
+  <link name="gripper_base">
+    <inertial>
+      <origin xyz="0 0 0.047" rpy="0 0 0"/>
+      <mass value="0.8"/>
+      <inertia ixx="0.00085" ixy="0" ixz="0" iyy="0.00139" iyz="0" izz="0.00104"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.008 -0.002 0.0475" rpy="0 0 0"/>
+      <geometry><box size="0.109 0.062 0.095"/></geometry>
+      <material name="pgi140_body"><color rgba="0.75 0.75 0.75 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.008 -0.002 0.0475" rpy="0 0 0"/>
+      <geometry><box size="0.109 0.062 0.095"/></geometry>
+    </collision>
+  </link>
+
+  <link name="gripper_finger1">
+    <inertial>
+      <origin xyz="0 0 0.03" rpy="0 0 0"/>
+      <mass value="0.1"/>
+      <inertia ixx="0.00006" ixy="0" ixz="0" iyy="0.00008" iyz="0" izz="0.00005"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0.013 0.008 0.014" rpy="0 0 0"/>
+      <geometry><box size="0.070 0.039 0.033"/></geometry>
+      <material name="pgi140_finger"><color rgba="0.9 0.9 0.9 1"/></material>
+    </visual>
+    <visual>
+      <origin xyz="0.011 -0.001 0.057" rpy="0 0 0"/>
+      <geometry><box size="0.022 0.021 0.055"/></geometry>
+      <material name="pgi140_finger"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.013 0.008 0.014" rpy="0 0 0"/>
+      <geometry><box size="0.070 0.039 0.033"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="0.011 -0.001 0.057" rpy="0 0 0"/>
+      <geometry><box size="0.022 0.021 0.055"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="gripper" type="prismatic">
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+    <parent link="gripper_base"/>
+    <child link="gripper_finger1"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.04" effort="140" velocity="0.1"/>
+  </joint>
+
+  <link name="gripper_finger2">
+    <inertial>
+      <origin xyz="0 0 0.03" rpy="0 0 0"/>
+      <mass value="0.1"/>
+      <inertia ixx="0.00006" ixy="0" ixz="0" iyy="0.00008" iyz="0" izz="0.00005"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.013 -0.011 0.014" rpy="0 0 0"/>
+      <geometry><box size="0.070 0.039 0.033"/></geometry>
+      <material name="pgi140_finger"/>
+    </visual>
+    <visual>
+      <origin xyz="-0.011 -0.002 0.057" rpy="0 0 0"/>
+      <geometry><box size="0.022 0.021 0.055"/></geometry>
+      <material name="pgi140_finger"/>
+    </visual>
+    <collision>
+      <origin xyz="0.013 -0.011 0.014" rpy="0 0 0"/>
+      <geometry><box size="0.070 0.039 0.033"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.011 -0.002 0.057" rpy="0 0 0"/>
+      <geometry><box size="0.022 0.021 0.055"/></geometry>
+    </collision>
+  </link>
+
+  <joint name="gripper_finger2_joint" type="prismatic">
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+    <parent link="gripper_base"/>
+    <child link="gripper_finger2"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.04" effort="140" velocity="0.1"/>
+    <mimic joint="gripper" multiplier="1" offset="0"/>
+  </joint>
+
+  <!-- Between the fingertips' pads, at mid height. -->
+  <link name="gripper_tcp"/>
+  <joint name="gripper_tcp_joint" type="fixed">
+    <origin xyz="0 0 0.137" rpy="0 0 0"/>
+    <parent link="gripper_base"/>
+    <child link="gripper_tcp"/>
+  </joint>
+</robot>

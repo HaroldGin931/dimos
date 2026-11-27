@@ -19,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 
 from dimos.control.connection.mock_joint_connection import MockJointConnection
+from dimos.control.connection_source import ConnectionSource
 from dimos.control.contract.limits import movable_joints
 from dimos.control.coordinator import TaskConfig
 from dimos.control.task import CoordinatorState, JointStateSnapshot
@@ -31,6 +32,7 @@ from dimos.manipulation.planning.spec.validation import prepare_robot_model
 from dimos.manipulation.planning.world.roboplan_world import RoboPlanWorld
 from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.sensor_msgs.JointState import JointState
+from dimos.msgs.std_msgs.Float32 import Float32
 from dimos.protocol.rpc.spec import RPCSpec
 from dimos.robot.manipulators.fr5.blueprints.teleop import (
     FR5TwistCoordinator,
@@ -39,6 +41,7 @@ from dimos.robot.manipulators.fr5.blueprints.teleop import (
     keyboard_teleop_fr5,
 )
 from dimos.robot.manipulators.fr5.config import (
+    FR5_GRIPPER_JOINT,
     FR5_HOME_DEG,
     FR5_JOINT_NAMES,
     FR5_MAX_JOINT_VELOCITY_RAD_S,
@@ -176,29 +179,6 @@ class _LocalRPC(Mock, RPCSpec):
     """Keep module lifecycle calls in process."""
 
 
-def test_simulated_arm_reports_the_joints_the_coordinator_expects(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(global_config, "simulation", "mujoco")
-    [mock] = [
-        atom
-        for atom in _simulated_teleop().solidify().blueprints
-        if atom.module is MockJointConnection
-    ]
-    arm = MockJointConnection(**mock.kwargs, rpc_transport=_LocalRPC)
-    arm.set_transport("position_command", Mock())
-    readings: list[JointState] = []
-    arm.joint_state.subscribe(readings.append)
-    arm.start()
-    try:
-        wait_until(lambda: readings, timeout=1, interval=0.01)
-    finally:
-        arm.stop()
-
-    assert readings[0].name == list(FR5_JOINT_NAMES)
-    assert readings[0].position == pytest.approx([math.radians(angle) for angle in FR5_HOME_DEG])
-
-
 def test_home_is_the_folded_pose_and_the_planner_accepts_it() -> None:
     pytest.importorskip("roboplan.core")
     config = make_fr5_model_config()
@@ -211,3 +191,77 @@ def test_home_is_the_folded_pose_and_the_planner_accepts_it() -> None:
     assert world.check_config_collision_free(
         JointState(name=list(FR5_JOINT_NAMES), position=list(config.home_joints))
     )
+
+
+def test_the_gripper_blueprint_opens_and_closes_arm_gripper_from_the_keyboard() -> None:
+    _, modules = _modules(keyboard_teleop_fr5)
+    tasks = _tasks(modules)
+    declaration = modules[FR5TwistCoordinator]["connections"][0]
+    source = ConnectionSource(declaration, ["position_command"], ["joint_state"], 0.1)
+
+    assert modules[FR5Connection] == {"gripper": True}
+    assert list(declaration.joint_commands) == [*FR5_JOINT_NAMES, FR5_GRIPPER_JOINT]
+    assert modules[ManipulationModule]["gripper_tasks"] == {"manipulator": tasks["gripper"].name}
+    # The arm's tasks leave the gripper to its own.
+    assert tasks["eef_twist"].joint_names == list(FR5_JOINT_NAMES)
+    assert tasks["trajectory"].joint_names == list(FR5_JOINT_NAMES)
+
+    task = control_task_registry.create(
+        "gripper", tasks["gripper"], hardware={}, connections={"arm": source}
+    )
+    # The keyboard's "[" sends 1.0, fully open; "]" sends 0.0.
+    assert task.on_gripper_command(Float32(data=1.0), 1.0)
+    opened = task.compute(_state([0.0] * 6, 1.008))
+    assert task.on_gripper_command(Float32(data=0.0), 2.0)
+    closed = task.compute(_state([0.0] * 6, 2.008))
+
+    assert opened is not None and opened.joint_names == [FR5_GRIPPER_JOINT]
+    assert opened.positions == pytest.approx([0.04])
+    assert closed is not None and closed.positions == pytest.approx([0.0])
+
+
+def test_the_simulated_gripper_starts_closed_beside_the_arm_at_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(global_config, "simulation", "mujoco")
+    blueprint = _simulated_teleop().solidify()
+    [mock] = [atom for atom in blueprint.blueprints if atom.module is MockJointConnection]
+    arm = MockJointConnection(**mock.kwargs, rpc_transport=_LocalRPC)
+    arm.set_transport("position_command", Mock())
+    readings: list[JointState] = []
+    arm.joint_state.subscribe(readings.append)
+    arm.start()
+    try:
+        wait_until(lambda: readings, timeout=1, interval=0.01)
+    finally:
+        arm.stop()
+
+    assert readings[0].name == [*FR5_JOINT_NAMES, FR5_GRIPPER_JOINT]
+    assert readings[0].position == pytest.approx(
+        [*(math.radians(angle) for angle in FR5_HOME_DEG), 0.0]
+    )
+
+
+def test_the_planner_accepts_the_gripper_and_home_keeps_it_clear_of_the_arm() -> None:
+    pytest.importorskip("roboplan.core")
+    config = make_fr5_model_config(gripper=True)
+    assert config.home_joints is not None
+    assert config.planning_groups[0].tip_link == "gripper_tcp"
+    world = RoboPlanWorld()
+    world.load_model(prepare_robot_model(config))
+    world.finalize()
+
+    assert world.check_config_collision_free(
+        JointState(name=list(FR5_JOINT_NAMES), position=list(config.home_joints))
+    )
+
+
+def test_without_a_gripper_the_arm_alone_is_driven_and_planned() -> None:
+    _, modules = _modules(_keyboard_teleop(gripper=False).remappings(fr5_remaps()))
+    declaration = modules[FR5TwistCoordinator]["connections"][0]
+
+    assert modules[FR5Connection] == {"gripper": False}
+    assert list(declaration.joint_commands) == list(FR5_JOINT_NAMES)
+    assert set(_tasks(modules)) == {"eef_twist", "trajectory"}
+    assert "gripper_tasks" not in modules[ManipulationModule]
+    assert modules[ManipulationModule]["model"].planning_groups[0].tip_link == "wrist3_link"

@@ -1099,7 +1099,7 @@ robots:
       blueprints:
         keyboard-teleop-fr5:
           title: FR5 keyboard driving
-          description: Move a FAIRINO FR5 with this computer's keyboard.
+          description: Move a FAIRINO FR5 and open and close its DH PGI-140-80 gripper with this computer's keyboard.
           recommended_config:
           - *robot_or_simulator
           - {module: fr5connection, field: ip, label: FR5 IP, placeholder: 192.168.58.2, required: false, when: {simulation: ''}}

@@ -19,6 +19,7 @@ DimOS fetches the SDK and model on first run. Enable the arm locally, then
 keyboard, and plans and runs trajectories from the Viser UI (the planning
 extra); a jog takes over from a running trajectory. With `--simulation`, a mock
 connection that echoes its targets stands in for the arm.
+The DH PGI-140-80 gripper on the flange opens and closes with `[` and `]`.
 
 Nothing here stops a jog at the edge of the arm's reach or before the arm
 meets itself: keep jogs short and watch the arm.
@@ -27,6 +28,7 @@ meets itself: keep jogs short and watch the arm.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 from dimos.control.connection.mock_joint_connection import MockJointConnection
 from dimos.control.contract.limits import movable_joints
@@ -41,6 +43,7 @@ from dimos.robot.manipulators.common.blueprints import planner
 from dimos.robot.manipulators.common.coordinators import ArmTwistCoordinator
 from dimos.robot.manipulators.common.topics import EEF_TWIST_TASK_NAME
 from dimos.robot.manipulators.fr5.config import (
+    FR5_GRIPPER_JOINT,
     FR5_HOME_DEG,
     FR5_JOINT_NAMES,
     FR5_MAX_JOINT_VELOCITY_RAD_S,
@@ -51,7 +54,7 @@ from dimos.robot.manipulators.fr5.config import (
 from dimos.robot.manipulators.fr5.connection import LINK_TIMEOUT_S, SERVO_PERIOD_S, FR5Connection
 from dimos.teleop.keyboard.keyboard_teleop_module import KeyboardTeleopModule
 
-_fr5_model = make_fr5_model_config()
+_GRIPPER_TASK_NAME = "arm_gripper"
 
 
 class FR5TwistCoordinator(ArmTwistCoordinator):
@@ -62,22 +65,28 @@ class FR5TwistCoordinator(ArmTwistCoordinator):
     arm_joint_state: In[JointState]
 
 
-def fr5_connection() -> Blueprint:
-    """``FR5Connection``, or a mock that echoes its targets when ``--simulation`` is on."""
+def fr5_connection(gripper: bool = False) -> Blueprint:
+    """``FR5Connection``, or a mock that echoes its targets when ``--simulation`` is on.
+
+    Args:
+        gripper: With the gripper on the flange; see ``fr5_model``.
+    """
     if global_config.simulation:
         # The mock names each model joint under its source, so it takes them bare.
-        model = fr5_model()
+        model = fr5_model(gripper)
+        # At zero the wrist is singular, where a straight jog spins j4 and j6.
+        # A gripper starts closed.
+        home = [*(math.radians(angle) for angle in FR5_HOME_DEG), *([0.0] if gripper else [])]
         return MockJointConnection.blueprint(
             source="arm",
             model=model,
             state_rate_hz=1 / SERVO_PERIOD_S,
-            # At zero the wrist is singular, where a straight jog spins j4 and j6.
             initial_positions={
-                joint.name: math.radians(angle)
-                for joint, angle in zip(movable_joints(model), FR5_HOME_DEG, strict=True)
+                joint.name: position
+                for joint, position in zip(movable_joints(model), home, strict=True)
             },
         )
-    return FR5Connection.blueprint()
+    return FR5Connection.blueprint(gripper=gripper)
 
 
 def fr5_remaps() -> list[tuple[type[ModuleBase], str, str]]:
@@ -91,19 +100,40 @@ def fr5_remaps() -> list[tuple[type[ModuleBase], str, str]]:
     ]
 
 
-def _keyboard_teleop() -> MetaBlueprint:
+def _keyboard_teleop(gripper: bool = True) -> MetaBlueprint:
     """Jog an FR5's wrist from this computer's keyboard, and plan its motions.
 
     The coordinator names the joints ``arm/j1`` ... ``arm/j6``. Wire it up with
     ``.remappings(fr5_remaps())``. An arm away from FAIRINO's default address is
     given at run time, after the blueprint name (``--fr5connection.ip <IP>``)
     or as ``FR5CONNECTION__IP``.
+
+    Args:
+        gripper: With the gripper on the flange; see ``fr5_model``. ``[`` and
+            ``]`` then open and close it, as the joint ``arm/gripper``.
     """
+    model = make_fr5_model_config(gripper)
+    gripper_tasks = (
+        # arm/gripper is how far each finger is from closed: open at its upper limit.
+        [
+            TaskConfig(
+                name=_GRIPPER_TASK_NAME,
+                type="gripper",
+                joint_names=[FR5_GRIPPER_JOINT],
+                priority=20,
+            )
+        ]
+        if gripper
+        else []
+    )
+    planner_options: dict[str, Any] = (
+        {"gripper_tasks": {"manipulator": _GRIPPER_TASK_NAME}} if gripper else {}
+    )
     return autoconnect(
         KeyboardTeleopModule.blueprint(),
         FR5TwistCoordinator.blueprint(
             instance_name="ControlCoordinator",
-            connections=[fr5_coordinator_connection()],
+            connections=[fr5_coordinator_connection(gripper)],
             tick_rate=1 / SERVO_PERIOD_S,
             reading_timeout_s=LINK_TIMEOUT_S,
             tasks=[
@@ -113,11 +143,11 @@ def _keyboard_teleop() -> MetaBlueprint:
                 TaskConfig(
                     name=EEF_TWIST_TASK_NAME,
                     type="eef_twist",
-                    joint_names=list(_fr5_model.joint_names),
+                    joint_names=list(model.joint_names),
                     # Above the trajectory task, so a jog takes over from a running trajectory.
                     priority=20,
                     params={
-                        "robot_model": _fr5_model,
+                        "robot_model": model,
                         "target_frame": "wrist3_link",
                         "max_joint_velocity_rad_s": FR5_MAX_JOINT_VELOCITY_RAD_S,
                     },
@@ -128,10 +158,11 @@ def _keyboard_teleop() -> MetaBlueprint:
                     priority=10,
                     velocity_limits=dict.fromkeys(FR5_JOINT_NAMES, FR5_MAX_JOINT_VELOCITY_RAD_S),
                 ),
+                *gripper_tasks,
             ],
         ),
-        fr5_connection(),
-        planner(model=_fr5_model, visualization={"backend": "viser"}),
+        fr5_connection(gripper),
+        planner(model=model, visualization={"backend": "viser"}, **planner_options),
     )
 
 

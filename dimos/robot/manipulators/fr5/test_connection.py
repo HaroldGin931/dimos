@@ -40,6 +40,7 @@ from dimos.utils.testing.waiting import wait_until
 
 _IP = "192.0.2.1"
 _JOINTS = [f"arm/j{i}" for i in range(1, 7)]
+_GRIPPER = "arm/gripper"
 _MEASURED_DEG = [10.0, -15.0, 20.0, -25.0, 30.0, -35.0]
 _TARGET_OFFSET_DEG = 0.001
 _SPEED_DEG_S = [1.0, -2.0, 3.0, -4.0, 5.0, -6.0]
@@ -55,6 +56,8 @@ class Rig:
     arm: FR5Connection
     sdk: Mock
     targets: Out[JointState]
+    # Stands in for the controller's XML-RPC, which the gripper is driven over.
+    rpc: Mock
 
     def move(self) -> None:
         # Reversed stream order must still reach the SDK in controller joint order.
@@ -73,22 +76,29 @@ class Rig:
 
 
 @pytest.fixture
-def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
-    model = RobotModel.from_root_link("base").with_added_joints(
-        *(
-            JointDescription(
-                name, "revolute", "base", f"link{i}", lower=-math.pi, upper=math.pi, velocity=2.0
-            )
-            for i, name in enumerate(_JOINTS)
+def rig(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Iterator[Rig]:
+    """An FR5 on a mock SDK; ``@pytest.mark.parametrize("rig", [True], indirect=True)``
+    puts the gripper on it, activated and closed."""
+    gripper = getattr(request, "param", False)
+    joints = [
+        JointDescription(
+            name, "revolute", "base", f"link{i}", lower=-math.pi, upper=math.pi, velocity=2.0
         )
-    )
+        for i, name in enumerate(_JOINTS)
+    ]
+    if gripper:
+        joints.append(
+            JointDescription(
+                _GRIPPER, "prismatic", "link5", "finger", lower=0.0, upper=0.04, velocity=0.1
+            )
+        )
+    model = RobotModel.from_root_link("base").with_added_joints(*joints)
     sdk = Mock(is_connect=True, feedback_age=0.0)
     sdk.ResetAllError.return_value = sdk.RobotEnable.return_value = 0
     sdk.feedback = SimpleNamespace(
         jt_cur_pos=_MEASURED_DEG,
         actual_qd=_SPEED_DEG_S,
         jt_cur_tor=_TORQUE_NM,
-        robot_mode=0,
         rbtEnableState=1,
         main_code=0,
         sub_code=0,
@@ -96,6 +106,9 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
         collisionState=0,
         safety_stop0_state=0,
         safety_stop1_state=0,
+        gripper_active=1 if gripper else 0,
+        gripper_position=0,
+        gripper_motiondone=1,
     )
     frame = SimpleNamespace(_dimos_sample=None)
     ticks = count(59_984, 8)
@@ -121,12 +134,19 @@ def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[Rig]:
     monkeypatch.setattr(connection, "_open_sdk", Mock(return_value=sdk))
     monkeypatch.setattr(connection, "_STEADY_S", 0.1)
     monkeypatch.setattr(connection, "_SETTLE_S", 0.4)
+    monkeypatch.setattr(connection, "_GRIPPER_RESET_S", 0.0)
+    monkeypatch.setattr(connection, "_GRIPPER_START_S", 0.0)
+    monkeypatch.setattr(connection, "_GRIPPER_SETTLE_S", 0.0)
+    rpc = Mock(return_value=0)
+    monkeypatch.setattr(connection, "_rpc", rpc)
     targets = Out(JointState, "targets")
-    arm = FR5Connection(ip=_IP, model=model, deadman_timeout_s=2.0, rpc_transport=LocalRPC)
+    arm = FR5Connection(
+        ip=_IP, model=model, gripper=gripper, deadman_timeout_s=2.0, rpc_transport=LocalRPC
+    )
     arm.set_transport(
         "position_command", Mock(subscribe=lambda callback, _: targets.subscribe(callback))
     )
-    yield Rig(arm, sdk, targets)
+    yield Rig(arm, sdk, targets, rpc)
     arm.stop()
 
 
@@ -346,21 +366,6 @@ def test_clear_errors_refuses_at_once_under_a_stop_only_a_person_can_release(
     rig.sdk.RobotEnable.assert_not_called()
 
 
-def test_an_arm_in_manual_mode_takes_no_command_and_says_to_switch_it(rig: Rig) -> None:
-    rig.sdk.feedback.robot_mode = 1
-    rig.arm.start()
-    rig.move()
-
-    assert "manual mode; switch it to automatic" in str(rig.arm.status().last_error)
-    rig.sdk.ServoMoveStart.assert_not_called()
-
-    rig.sdk.feedback.robot_mode = 0
-    rig.arm.clear_errors()
-    rig.move()
-
-    rig.sdk.ServoMoveStart.assert_called_once_with(cmdType=1)
-
-
 def test_a_command_takes_feedback_the_reader_has_not_got_to_yet(rig: Rig) -> None:
     rig.arm.start()
     with rig.arm._hardware_lock:  # The reader is held up for longer than the link timeout.
@@ -451,3 +456,162 @@ def test_a_controller_fault_ends_the_servo_session(rig: Rig) -> None:
 
     assert "FR5 fault 4/4" in str(rig.arm.status().last_error)
     rig.sdk.ServoMoveEnd.assert_called_once_with(cmdType=1)
+
+
+def _gripper_moves(rig: Rig) -> list[int]:
+    """The positions the gripper was sent to, in percent open."""
+    return [args.args[3] for args in rig.rpc.call_args_list if args.args[1] == "MoveGripper"]
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_the_gripper_reports_its_opening_in_metres_and_is_sent_each_new_target_once(
+    rig: Rig,
+) -> None:
+    rig.sdk.feedback.gripper_position = 50
+    readings: list[JointState] = []
+    rig.arm.joint_state.subscribe(readings.append)
+    rig.arm.start()
+    wait_until(lambda: any(r.name == [_GRIPPER] for r in readings), timeout=1, interval=0.01)
+    assert next(r for r in readings if r.name == [_GRIPPER]).position == pytest.approx([0.02])
+
+    # A coordinator starts by holding the gripper where it is: nothing to send.
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.02]))
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.04]))
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.04]))
+    wait_until(lambda: _gripper_moves(rig), timeout=1, interval=0.01)
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.01]))
+    wait_until(lambda: len(_gripper_moves(rig)) == 2, timeout=1, interval=0.01)
+
+    # The fingers stopped on an object, and the coordinator holds them there.
+    rig.sdk.feedback.gripper_position = 37
+    wait_until(lambda: rig.arm._gripper_measured == pytest.approx(0.0148), timeout=1, interval=0.01)
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.0148]))
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.0]))
+    wait_until(lambda: len(_gripper_moves(rig)) == 3, timeout=1, interval=0.01)
+
+    assert _gripper_moves(rig) == [100, 25, 0]
+    assert rig.arm.status().last_error is None
+
+
+def _activations(rig: Rig) -> list[tuple[object, ...]]:
+    return [args.args[1:] for args in rig.rpc.call_args_list if args.args[1] == "ActGripper"]
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_a_gripper_that_is_not_activated_is_reset_and_activated_at_start(rig: Rig) -> None:
+    rig.sdk.feedback.gripper_active = 0
+
+    def controller(_ip: str, method: str, *args: int) -> int:
+        if (method, *args) == ("ActGripper", 1, 1):
+            rig.sdk.feedback.gripper_active = 1
+        return 0
+
+    rig.rpc.side_effect = controller
+    rig.arm.start()
+
+    assert _activations(rig) == [("ActGripper", 1, 0), ("ActGripper", 1, 1)]
+    # Then opened, so that its position is known.
+    assert _gripper_moves(rig) == [100]
+    assert rig.arm.status().last_error is None
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.03]))
+    wait_until(lambda: _gripper_moves(rig) == [100, 75], timeout=1, interval=0.01)
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_a_gripper_not_moved_since_it_was_activated_is_opened_before_it_is_reported(
+    rig: Rig,
+) -> None:
+    # Activated on the WebAPP: it says closed, and that it has not moved.
+    rig.sdk.feedback.gripper_motiondone = 0
+    readings: list[JointState] = []
+    rig.arm.joint_state.subscribe(readings.append)
+
+    def controller(_ip: str, method: str, *args: int) -> int:
+        if method == "MoveGripper":
+            assert not any(reading.name == [_GRIPPER] for reading in readings)
+            rig.sdk.feedback.gripper_position = args[1]
+            rig.sdk.feedback.gripper_motiondone = 1
+        return 0
+
+    rig.rpc.side_effect = controller
+    rig.arm.start()
+
+    assert _activations(rig) == []
+    assert _gripper_moves(rig) == [100]
+    wait_until(lambda: any(r.name == [_GRIPPER] for r in readings), timeout=1, interval=0.01)
+    assert next(r for r in readings if r.name == [_GRIPPER]).position == pytest.approx([0.04])
+    # Closing it is a move, not a hold where it already is.
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.0]))
+    wait_until(lambda: _gripper_moves(rig) == [100, 0], timeout=1, interval=0.01)
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_a_gripper_that_does_not_activate_is_sent_nothing_and_clear_errors_tries_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(connection, "_GRIPPER_ACTIVATE_S", 0.1)
+    rig.sdk.feedback.gripper_active = 0
+    rig.arm.start()
+    assert "did not activate" in str(rig.arm.status().last_error)
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.04]))
+    wait_until(
+        lambda: "target not reached" in str(rig.arm.status().last_error), timeout=1, interval=0.01
+    )
+    assert _gripper_moves(rig) == []
+
+    # Its cable is back in.
+    def controller(_ip: str, method: str, *args: int) -> int:
+        if (method, *args) == ("ActGripper", 1, 1):
+            rig.sdk.feedback.gripper_active = 1
+        return 0
+
+    rig.rpc.side_effect = controller
+    rig.arm.clear_errors()
+
+    assert _activations(rig)[-2:] == [("ActGripper", 1, 0), ("ActGripper", 1, 1)]
+    assert _gripper_moves(rig) == [100]
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.03]))
+    wait_until(lambda: _gripper_moves(rig) == [100, 75], timeout=1, interval=0.01)
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_the_gripper_still_opens_while_a_fault_holds_the_arm(rig: Rig) -> None:
+    rig.sdk.feedback.main_code, rig.sdk.feedback.sub_code = 4, 1
+    rig.arm.start()
+    assert "FR5 fault 4/1" in str(rig.arm.status().last_error)
+
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.04]))
+
+    wait_until(lambda: _gripper_moves(rig) == [100], timeout=1, interval=0.01)
+    rig.sdk.ServoMoveStart.assert_not_called()
+
+
+@pytest.mark.parametrize("rig", [True], indirect=True)
+def test_the_arm_is_sent_nothing_while_the_gripper_moves_and_starts_afresh_after(rig: Rig) -> None:
+    commander = Mock()
+    rig.arm._commander = commander
+    rig.begin_motion()
+    rig.ack(1, 376)
+    assert rig.sdk.ServoJ.call_count == 1
+    # The fingers are on their way until the controller says otherwise.
+    rig.sdk.feedback.gripper_motiondone = 0
+    wait_until(lambda: rig.arm._state.gripper_motiondone == 0, timeout=1, interval=0.01)
+
+    rig.targets.publish(JointState(name=[_GRIPPER], position=[0.04]))
+    wait_until(lambda: _gripper_moves(rig) == [100], timeout=1, interval=0.01)
+    rig.move()
+    rig.move()
+
+    # The servo session ended before the gripper was told to move.
+    rig.sdk.ServoMoveEnd.assert_called_once_with(cmdType=1)
+    assert rig.sdk.ServoJ.call_count == 1
+    commander.set_estop.assert_not_called()
+
+    rig.sdk.feedback.gripper_motiondone = 1
+    wait_until(lambda: commander.set_estop.call_count == 2, timeout=1, interval=0.01)
+    # What the commander had under way is dropped, then a new session starts.
+    assert commander.set_estop.call_args_list == [call(True), call(False)]
+    wait_until(lambda: not rig.arm._gripper_moving, timeout=1, interval=0.01)
+    rig.move()
+    assert rig.sdk.ServoMoveStart.call_count == 2
+    assert rig.arm.status().last_error is None

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from hashlib import sha256
 import ipaddress
 import math
@@ -43,7 +44,11 @@ from dimos.core.core import rpc
 from dimos.core.stream import In, Out
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.manipulators.fr5.cnde import install_cnde_reader
-from dimos.robot.manipulators.fr5.config import FR5_JOINT_NAMES, fr5_coordinator_connection
+from dimos.robot.manipulators.fr5.config import (
+    FR5_GRIPPER_JOINT,
+    FR5_JOINT_NAMES,
+    fr5_coordinator_connection,
+)
 from dimos.spec.utils import Spec
 from dimos.utils.logging_config import setup_logger
 
@@ -74,11 +79,29 @@ _SDK_SOURCE_SHA256 = "8dd4ec225a6d1cf149a149c6fdf09e112a5d6fd989426702997bd9cc38
 _FAULT_CAUSES = {
     3: ": a joint is past its soft limit; drag it back into range",
     4: ": collision; move the arm clear of it",
+    8: ": the gripper, or another device on the tool end",
 }
 # After clear_errors(), the arm must report itself clear for _STEADY_S on end,
 # within _SETTLE_S, before it takes commands again.
 _STEADY_S = 0.5
 _SETTLE_S = 3.0
+# The gripper's device ID on the controller, as the WebAPP shows it.
+_GRIPPER_ID = 1
+# MoveGripper's speed and force, in percent, and how long the controller gives
+# the fingers to arrive, in ms. With a force of 0 the fingers do not move.
+_GRIPPER_SPEED = 30
+_GRIPPER_FORCE = 30
+_GRIPPER_MOVE_MS = 5000
+# After MoveGripper, how long until the feedback shows the fingers moving, and
+# after the last of the moves asked for, how long until the arm is streamed
+# targets again.
+_GRIPPER_START_S = 0.3
+_GRIPPER_SETTLE_S = 2.0
+# How long between resetting the gripper and activating it, and how long it
+# is then given to find its ends.
+_GRIPPER_RESET_S = 1.0
+_GRIPPER_ACTIVATE_S = 15.0
+_RPC_TIMEOUT_S = 2.0
 
 
 class FR5CommanderSpec(Spec, Protocol):
@@ -92,12 +115,17 @@ class FR5ConnectionConfig(ConnectionConfig):
 
     Attributes:
         ip: The controller's IP address; FAIRINO ships it as 192.168.58.2.
+        gripper: DH-Robotics' PGI-140-80 gripper is on its flange, configured
+            on the controller as pre-adapted device 1.
+            It is driven as the joint ``arm/gripper``, how far each finger is
+            from closed, in metres.
         source: Always "arm": the driver names the joints ``arm/j1`` ... ``arm/j6``.
         jump_limit_s: How far a joint target may be from where the joint is,
             in seconds at the joint's top speed (its URDF velocity limit).
     """
 
     ip: str = FR5_DEFAULT_IP
+    gripper: bool = False
     source: Literal["arm"] = "arm"
     joint_commands: dict[str, tuple[Interface, ...]] = {}
     jump_limit_s: float = LINK_TIMEOUT_S
@@ -110,7 +138,7 @@ class FR5ConnectionConfig(ConnectionConfig):
 
     @model_validator(mode="after")
     def _defaults(self) -> Self:
-        declaration = fr5_coordinator_connection()
+        declaration = fr5_coordinator_connection(self.gripper)
         if self.model is None:
             self.model = declaration.model
         if not self.joint_commands:
@@ -123,13 +151,22 @@ class FR5Connection(ConnectionModule):
 
     A servo session starts with the first command and ends on ``halt``, e.g.
     when commands stop; the next command starts a new one. Stale feedback, a
-    fault, a safety stop, manual mode, a disabled arm, a target too far from the measured
+    fault, a safety stop, a disabled arm, a target too far from the measured
     position, or a refused or unanswered UDP command ends the session, and the
     arm takes no command until ``clear_errors()``; its joints are still
     reported. An arm in such a state at start-up starts the same way. A target
     further ahead than the joint's top speed covers in one period is approached
     one such step per ServoJ. The controller's singular-pose notice is logged
     and ends nothing.
+
+    With ``config.gripper``, the joint ``arm/gripper`` opens and closes the
+    gripper (0 m closed, 0.04 m open); each new target is passed to the
+    controller from a thread of its own, and the gripper's position goes out on
+    ``joint_state`` in a message of its own. At start and in
+    ``clear_errors()``, a gripper that is not activated is activated, its
+    fingers running through their travel, and one that has not moved since it
+    was activated is opened: until then it reports itself closed wherever its
+    fingers are.
     """
 
     config: FR5ConnectionConfig
@@ -159,16 +196,34 @@ class FR5Connection(ConnectionModule):
         self._notice_logged_at = float("-inf")
         self._stop_reader = threading.Event()
         self._reader: threading.Thread | None = None
+        # The gripper's target and the one last passed to the controller, in m.
+        self._gripper_target: float | None = None
+        self._gripper_sent: float | None = None
+        self._gripper_measured = 0.0
+        # Set by write with a new gripper target, cleared by the gripper's thread.
+        self._gripper_moving = False
+        # How far each finger opens, in m: the gripper joint's upper limit in the model.
+        self._gripper_travel = 0.0
+        self._gripper_wake = threading.Event()
+        # Asked for by _ready_gripper and settled by the gripper's thread: the
+        # request, and whether to reset and activate the gripper first.
+        self._gripper_readying: tuple[Future[None], bool] | None = None
+        # The gripper's position is reported from when it is known.
+        self._gripper_ready = False
+        self._gripper_thread: threading.Thread | None = None
 
     def connect(self) -> None:
         assert self.config.model is not None
         joints = movable_joints(self.config.model)
-        if tuple(joint.name for joint in joints) != FR5_JOINT_NAMES:
-            raise ValueError(f"FR5Connection drives the joints {', '.join(FR5_JOINT_NAMES)}")
-        speeds = [model_limit(joint, Interface.VELOCITY).hi or 0.0 for joint in joints]
+        names = (*FR5_JOINT_NAMES, *((FR5_GRIPPER_JOINT,) if self.config.gripper else ()))
+        if tuple(joint.name for joint in joints) != names:
+            raise ValueError(f"FR5Connection drives the joints {', '.join(names)}")
+        speeds = [model_limit(joint, Interface.VELOCITY).hi or 0.0 for joint in joints[:6]]
+        if self.config.gripper:
+            self._gripper_travel = model_limit(joints[6], Interface.POSITION).hi or 0.0
         self._step_limits = [speed * SERVO_PERIOD_S for speed in speeds]
         self._reach = [speed * self.config.jump_limit_s for speed in speeds]
-        sdk = self._sdk = _open_sdk(self.config.ip)
+        sdk = self._sdk = _open_sdk(self.config.ip, gripper=self.config.gripper)
         try:
             if not sdk.is_connect:
                 raise ConnectionError(f"FR5 SDK could not connect to {self.config.ip}")
@@ -201,12 +256,20 @@ class FR5Connection(ConnectionModule):
         )
         self._reader = threading.Thread(target=self._read_loop, name="FR5 feedback", daemon=True)
         self._reader.start()
+        if self.config.gripper:
+            self._gripper_thread = threading.Thread(
+                target=self._gripper_loop, name="FR5 gripper", daemon=True
+            )
+            self._gripper_thread.start()
+            self._ready_gripper()
 
     @rpc
     def stop(self) -> None:
         self._stop_reader.set()
-        if self._reader:
-            self._reader.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self._gripper_wake.set()
+        for thread in (self._reader, self._gripper_thread):
+            if thread:
+                thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         try:
             super().stop()
         finally:
@@ -257,13 +320,67 @@ class FR5Connection(ConnectionModule):
                         raise problem
                     time.sleep(SERVO_PERIOD_S)
                 self._fault = None
+            self._ready_gripper()
         finally:
             if commander is not None:
                 commander.set_estop(False)
 
+    def _ask_gripper_thread(self, *, reset: bool) -> None:
+        """Have the gripper's thread open the gripper, after resetting and
+        activating it if ``reset``, and wait until it has."""
+        request: Future[None] = Future()
+        with self._hardware_lock:
+            self._gripper_moving = True
+            self.halt()
+            self._gripper_readying = (request, reset)
+            self._gripper_wake.set()
+        request.result(
+            timeout=_GRIPPER_RESET_S
+            + _GRIPPER_ACTIVATE_S
+            + _GRIPPER_MOVE_MS / 1000
+            + _GRIPPER_SETTLE_S
+            + 5.0
+        )
+
+    def _ready_gripper(self) -> None:
+        """Activate a gripper that is not activated, and open one whose position
+        is not known; say so if it cannot be done.
+
+        An activated gripper reports itself closed, wherever its fingers are,
+        until it has been moved once.
+        """
+        if not self.config.gripper:
+            return
+        try:
+            if not self._gripper_active():
+                self._ask_gripper_thread(reset=True)
+            elif self._state.gripper_motiondone == 0:
+                self._ask_gripper_thread(reset=False)
+        except Exception as error:
+            self._report(f"gripper not ready: {error}")
+        finally:
+            self._gripper_ready = True
+
     def write(self, values: Values) -> None:
+        # The gripper takes its target whatever state the arm is in.
+        gripper = values.get(f"{FR5_GRIPPER_JOINT}/{Interface.POSITION}")
+        if self.config.gripper and gripper is not None and gripper != self._gripper_target:
+            # A coordinator holds the gripper where it reports itself, at start
+            # and after an emergency stop: nothing to send, and sending it
+            # could loosen a grasp.
+            if abs(gripper - self._gripper_measured) < self._gripper_travel / 100:
+                self._gripper_sent = gripper
+            self._gripper_target = gripper
+            if gripper != self._gripper_sent:
+                # The servo session ends here, and the arm takes no target until
+                # the gripper has arrived: see _gripper_loop.
+                self._gripper_moving = True
+                self.halt()
+                self._gripper_wake.set()
         if self._fault is not None:
             raise RuntimeError(self._fault)
+        if self._gripper_moving:
+            return
         try:
             # Take a sample the reader has not got to yet, so that a late reader
             # is not mistaken for stale feedback.
@@ -373,6 +490,7 @@ class FR5Connection(ConnectionModule):
         self._state = state
         self._measured = positions
         self._measured_at = received_at
+        self._gripper_measured = self._gripper_travel * min(state.gripper_position, 100) / 100
         if self._connected:
             wall_time = time.time() - (time.monotonic() - received_at)
             self.joint_state.publish(
@@ -384,7 +502,132 @@ class FR5Connection(ConnectionModule):
                     effort=list(state.jt_cur_tor),
                 )
             )
+            if self._gripper_ready:
+                # The gripper reports no speed or effort, so it has a message of its own.
+                self.joint_state.publish(
+                    JointState(
+                        ts=wall_time, name=[FR5_GRIPPER_JOINT], position=[self._gripper_measured]
+                    )
+                )
         return True
+
+    def _gripper_active(self) -> bool:
+        """Whether the newest sample shows the gripper activated."""
+        # One bit per device ID, from ID 1 in bit 0.
+        state = self._state
+        return state is not None and bool(state.gripper_active >> (_GRIPPER_ID - 1) & 1)
+
+    def _gripper_loop(self) -> None:
+        """Move the gripper to each new target, with the arm's servo session ended.
+
+        While the arm is streamed ServoJ, a gripper move makes the controller
+        stop answering for over a second as the move ends: ServoJ replies and
+        later gripper commands time out. So ``write`` ends the servo session
+        and sends the arm nothing until the gripper has arrived. The arm stays
+        where it is meanwhile; what the commander had under way is then
+        dropped, as by ``clear_errors()``, so the arm does not jump to where a
+        trajectory or a jog got to without it.
+        """
+        while self._gripper_wake.wait() and not self._stop_reader.is_set():
+            self._gripper_wake.clear()
+            moved = False
+            with self._hardware_lock:
+                readying, self._gripper_readying = self._gripper_readying, None
+            if readying is not None:
+                request, reset = readying
+                moved = True
+                try:
+                    if reset:
+                        self._reset_and_activate_gripper()
+                    self._move_gripper(self._gripper_travel)
+                    request.set_result(None)
+                except Exception as error:
+                    request.set_exception(error)
+                with self._hardware_lock:
+                    # A target from before, held meanwhile, is not gone back to.
+                    self._gripper_sent = self._gripper_target
+            while not self._stop_reader.is_set():
+                with self._hardware_lock:
+                    target = self._gripper_target
+                    if target is None or target == self._gripper_sent:
+                        if not moved:
+                            self._gripper_moving = False
+                        break
+                    self._gripper_sent = target
+                moved = True
+                try:
+                    self._move_gripper(target)
+                except Exception as error:
+                    self._report(f"gripper target not reached: {error}")
+            if not moved:
+                continue
+            # The controller is busy for a while after the fingers stop: the
+            # next gripper target need not wait for it, the arm's stream must.
+            time.sleep(_GRIPPER_SETTLE_S)
+            commander = self._commander
+            try:
+                if commander is not None:
+                    commander.set_estop(True)
+                    commander.set_estop(False)
+            except Exception as error:
+                self._report(f"the commander's tasks were not dropped: {error}")
+            finally:
+                with self._hardware_lock:
+                    # A target that came meanwhile keeps the arm waiting.
+                    self._gripper_moving = self._gripper_target != self._gripper_sent
+                self._gripper_wake.set()
+
+    def _reset_and_activate_gripper(self) -> None:
+        _check("ActGripper", _rpc(self.config.ip, "ActGripper", _GRIPPER_ID, 0))
+        time.sleep(_GRIPPER_RESET_S)
+        _check("ActGripper", _rpc(self.config.ip, "ActGripper", _GRIPPER_ID, 1))
+        deadline = time.monotonic() + _GRIPPER_ACTIVATE_S
+        while not self._gripper_active():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("the FR5 gripper did not activate; check it on the WebAPP")
+            time.sleep(SERVO_PERIOD_S)
+        # The controller is busy for a while after the fingers stop.
+        time.sleep(_GRIPPER_SETTLE_S)
+        logger.info("FR5 gripper activated")
+
+    def _move_gripper(self, target: float) -> None:
+        """Send the gripper to ``target`` metres and wait until it reports itself there."""
+        if not self._gripper_active():
+            raise RuntimeError("it is not activated; clear_errors() tries again")
+        percent = round(100 * min(max(target / self._gripper_travel, 0.0), 1.0))
+        started = time.monotonic()
+        # A parallel gripper; the call returns before the fingers arrive.
+        code = _rpc(
+            self.config.ip,
+            "MoveGripper",
+            _GRIPPER_ID,
+            percent,
+            _GRIPPER_SPEED,
+            _GRIPPER_FORCE,
+            _GRIPPER_MOVE_MS,
+            1,
+            0,
+            0.0,
+            0,
+            0,
+        )
+        _check("MoveGripper", code)
+        # The move shows in the feedback a few samples later.
+        time.sleep(_GRIPPER_START_S)
+        deadline = started + _GRIPPER_MOVE_MS / 1000
+        while self._state.gripper_motiondone == 0:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"it did not arrive within {_GRIPPER_MOVE_MS} ms")
+            time.sleep(SERVO_PERIOD_S)
+        state = self._state
+        logger.info(
+            "FR5 gripper moved",
+            told_percent_open=percent,
+            reports_percent_open=state.gripper_position,
+            # The controller's word for fingers stopped by something between them.
+            holding=state.gripper_motiondone == 2,
+            seconds=round(time.monotonic() - started, 2),
+        )
 
     def _check_stops(self) -> None:
         """Raise if the newest sample shows a stop only a person can release."""
@@ -395,7 +638,7 @@ class FR5Connection(ConnectionModule):
             raise RuntimeError("FR5 safety stop input is active; release it")
 
     def _check_state(self) -> None:
-        """Raise if the newest sample shows a stop, a fault, manual mode or a disabled arm."""
+        """Raise if the newest sample shows a stop, a fault or a disabled arm."""
         self._check_stops()
         state = self._state
         code = (state.main_code, state.sub_code)
@@ -411,8 +654,6 @@ class FR5Connection(ConnectionModule):
             raise RuntimeError(f"FR5 fault {state.main_code}/{state.sub_code}{cause}")
         if state.collisionState:
             raise RuntimeError("FR5 reports a collision; move the arm clear of it")
-        if state.robot_mode != 0:
-            raise RuntimeError("FR5 is in manual mode; switch it to automatic on the pendant")
         if state.rbtEnableState != 1:
             raise RuntimeError("FR5 is not enabled")
 
@@ -505,17 +746,20 @@ def _load_sdk() -> ModuleType:
     return sdk
 
 
-def _open_sdk(ip: str) -> Any:
-    # The vendor's GetSoftwareVersion retries socket errors forever. Make this
-    # read-only identification request once, with a timeout, before opening a session.
+def _rpc(ip: str, method: str, *args: Any) -> Any:
+    """Call the controller once over XML-RPC, with a timeout, on a connection of its own.
+
+    The vendor SDK retries socket errors forever, and shares one connection
+    between threads.
+    """
     with requests.Session() as http:
         http.trust_env = False
         try:
             response = http.post(
                 f"http://{ip}:{_SDK_RPC_PORT}/RPC2",
-                data=xmlrpc.client.dumps((), "GetSoftwareVersion"),
+                data=xmlrpc.client.dumps(args, method),
                 headers={"Content-Type": "text/xml"},
-                timeout=2.0,
+                timeout=_RPC_TIMEOUT_S,
                 allow_redirects=False,
             )
         except (requests.ConnectionError, requests.Timeout) as error:
@@ -525,8 +769,13 @@ def _open_sdk(ip: str) -> Any:
             ) from error
         response.raise_for_status()
         result, _ = xmlrpc.client.loads(response.content)
-    match result:
-        case ([int(code), str(model), str(web_version), str(controller_version)],):
+    return result[0]
+
+
+def _open_sdk(ip: str, *, gripper: bool = False) -> Any:
+    # Identify the controller, read-only, before opening a session.
+    match _rpc(ip, "GetSoftwareVersion"):
+        case [int(code), str(model), str(web_version), str(controller_version)]:
             _check("GetSoftwareVersion", code)
         case _:
             raise ValueError("FR5 returned an invalid software version response")
@@ -548,7 +797,6 @@ def _open_sdk(ip: str) -> Any:
         state.JointCurPos,
         state.ActualJointVel,
         state.ActualJointTorque,
-        state.RobotMode,
         state.RbtEnableState,
         state.MainCode,
         state.SubCode,
@@ -556,6 +804,7 @@ def _open_sdk(ip: str) -> Any:
         state.CollisionState,
         state.SafetyStop0State,
         state.SafetyStop1State,
+        *((state.GripperActive, state.GripperPosition, state.GripperMotiondone) if gripper else ()),
         state.RobotTime,
     ]
     _check(
